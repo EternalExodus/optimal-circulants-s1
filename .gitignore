@@ -1,0 +1,6 @@
+*.exe
+*.o
+*.gcda
+*.csv
+bench_out/
+tmp/
