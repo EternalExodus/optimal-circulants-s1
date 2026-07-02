@@ -1,4 +1,4 @@
-// circulant_mt.cpp
+// circulant_mt_fast.cpp
 //
 // Multithreaded exact search for optimal circulant graphs C(N; 1, s2, ..., sk).
 // Optimality criterion: minimize average shortest path length (sum of distances)
@@ -100,7 +100,19 @@ static bool is_canonical(int N, const int* __restrict__ sig, int k, const int* _
         int g = sig[gi];
         int m = inv[g];
         if (m == 0) continue;              // not invertible
-        for (int j = 0; j < k; ++j) img[j] = br.fold((u64)sig[j] * (u64)m);
+        // Fast path. The image always contains 1 (fold(sig[gi]*m) = 1) and the
+        // signature starts with 1, so the lexicographic comparison is decided by the
+        // second smallest element: m2 = min over j != gi of fold(sig[j]*m), versus sig[1].
+        // The full sort is needed only when they are equal.
+        int m2 = N;
+        for (int j = 0; j < k; ++j) {
+            if (j == gi) { img[j] = 1; continue; }
+            int v = (int)br.fold((u64)sig[j] * (u64)m);
+            img[j] = v;
+            if (v < m2) m2 = v;
+        }
+        if (m2 < sig[1]) return false;     // image strictly smaller
+        if (m2 > sig[1]) continue;         // image strictly larger, normalization passed
         for (int a = 1; a < k; ++a) { int v = img[a], b = a - 1;
             while (b >= 0 && img[b] > v) { img[b + 1] = img[b]; --b; } img[b + 1] = v; }
         for (int j = 0; j < k; ++j) { if (img[j] < sig[j]) return false; if (img[j] > sig[j]) break; }
@@ -108,20 +120,27 @@ static bool is_canonical(int N, const int* __restrict__ sig, int k, const int* _
     return true;
 }
 
-// Pruned BFS over Z_N. Generation technique: instead of clearing dist[] in O(N) on
-// every call we keep a per-vertex epoch tag seen[]; dist[] is valid only where
-// seen == epoch. Central symmetry d(v) = d(N - v) lets one probe mark a pair of
-// vertices at once. At each layer boundary a lower bound on the distance sum is
-// compared against the current record; the search aborts as soon as it cannot win.
+// Pruned BFS over Z_N. State is packed into a single array vals[] instead of a pair
+// (dist[], seen[]): vals[v] = (epoch << DIST_BITS) | dist. A vertex is visited iff the
+// high bits equal the current epoch tag; the distance is the low DIST_BITS bits. This
+// halves the random memory traffic of marking (one store instead of two) without
+// changing the traversal order or the pruning schedule. Central symmetry d(v)=d(N-v)
+// lets one probe mark a pair of vertices. At each layer boundary a lower bound on the
+// distance sum is compared against the record; the search aborts as soon as it cannot win.
+// Limitation: diameter < 2^DIST_BITS (= 1024), ample for the practical range of N.
+static const int DIST_BITS = 10;
+static const u32 DIST_MASK = (1u << DIST_BITS) - 1;
+
 static bool bfs(int N, int k, const int* __restrict__ s, int mode, u64 best_ds,
-                u32* __restrict__ dist, u32* __restrict__ seen, u32 epoch, int* __restrict__ queue,
+                u32* __restrict__ vals, u32 epoch, int* __restrict__ queue,
                 const u64* caps, int capsN, u32& out_diam, u64& out_ds) {
-    seen[0] = epoch; dist[0] = 0; queue[0] = 0;
+    const u32 tag = epoch << DIST_BITS;
+    vals[0] = tag; queue[0] = 0;
     u32 qr = 0, qw = 1, vc = 1, curd = 0;
     u64 dsum = 0;
     while (vc < (u32)N && qr != qw) {
         const int u = queue[qr++];
-        const u32 d = dist[u] + 1;
+        const u32 d = (vals[u] & DIST_MASK) + 1;
         if (curd != d) {
             curd = d;
             u64 lb;
@@ -137,15 +156,16 @@ static bool bfs(int N, int k, const int* __restrict__ s, int mode, u64 best_ds,
             }
             if (lb > best_ds) return false;
         }
+        const u32 wd = tag | d;
         for (int i = 0; i < k; ++i) {
             const int sj = s[i];
             int a = u + sj; if (a >= N) a -= N;
             int b = u - sj; if (b < 0) b += N;
-            if (seen[a] != epoch) { int ma = N - a; seen[a] = epoch; dist[a] = d;
-                if (ma != a) { seen[ma] = epoch; dist[ma] = d; }
+            if ((vals[a] & ~DIST_MASK) != tag) { int ma = N - a; vals[a] = wd;
+                if (ma != a) vals[ma] = wd;
                 queue[qw++] = a; int add = (ma != a) ? 2 : 1; vc += add; dsum += (u64)d * add; }
-            if (seen[b] != epoch) { int mb = N - b; seen[b] = epoch; dist[b] = d;
-                if (mb != b) { seen[mb] = epoch; dist[mb] = d; }
+            if ((vals[b] & ~DIST_MASK) != tag) { int mb = N - b; vals[b] = wd;
+                if (mb != b) vals[mb] = wd;
                 queue[qw++] = b; int add = (mb != b) ? 2 : 1; vc += add; dsum += (u64)d * add; }
         }
     }
@@ -197,7 +217,7 @@ static void run_one(int N, int k, int mode, int threads, std::FILE* out) {
     long long npairs = (long long)pairs.size();
 
     auto worker = [&](int tid) {
-        std::vector<u32> dist(N), seen(N, 0);
+        std::vector<u32> vals(N, 0);      // packed (epoch << DIST_BITS) | dist
         u32 epoch = 0;
         std::vector<int> queue(N);
         int sig[KMAX]; sig[0] = 1;
@@ -210,8 +230,9 @@ static void run_one(int N, int k, int mode, int threads, std::FILE* out) {
             if (!is_canonical(N, sig, k, inv.data(), br)) return;
             if (++since >= REREAD) { local_best = best.key.load(std::memory_order_relaxed); since = 0; }
             u32 D; u64 ds;
-            if (++epoch == 0) { std::fill(seen.begin(), seen.end(), 0u); epoch = 1; } // epoch wraparound
-            if (bfs(N, k, sig, mode, unpack_ds(local_best), dist.data(), seen.data(), epoch,
+            // epoch occupies 32 - DIST_BITS bits; clear the array on wraparound
+            if (++epoch == (1u << (32 - DIST_BITS))) { std::fill(vals.begin(), vals.end(), 0u); epoch = 1; }
+            if (bfs(N, k, sig, mode, unpack_ds(local_best), vals.data(), epoch,
                     queue.data(), caps.data(), capsN, D, ds)) {
                 u64 nk = pack(D, ds);
                 u64 cur = best.key.load(std::memory_order_relaxed);
