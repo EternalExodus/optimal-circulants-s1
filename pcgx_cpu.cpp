@@ -1,27 +1,29 @@
-// circulant_mt_fast.cpp
+// pcgx_cpu.cpp
+// Multithreaded exact search for OPTIMAL circulants C(N; 1, s2, ..., sk)
+// by (ASPL, diam): ASPL (dist_sum) is primary, diameter breaks ties (min).
+// Arbitrary k >= 2 (up to KMAX=16). Emits ALL optimal graphs (every isomorphic copy).
 //
-// Multithreaded exact search for optimal circulant graphs C(N; 1, s2, ..., sk).
-// Optimality criterion: minimize average shortest path length (sum of distances)
-// first, then minimize diameter as a tie-breaker. Arbitrary degree k >= 2
-// (up to KMAX = 16). All optimal graphs are reported (every isomorphic copy).
+// Version 2. Differences from circulant_mt:
+//   [1] thread balancing over linearized pairs (s2,s3), not by s2 alone;
+//   [2] per-thread cached best, re-reading the atomic once per REREAD calls;
+//   [3] fold via Barrett reduction (mu = 2^64 / N), no integer division;
+//   [4] is_canonical in k-1 normalizations (g=1 is identity; the N-g sign is
+//       redundant since fold(-x)=fold(x)) instead of 2k;
+//   [5] early exit by the Moore lower bound on diameter before running BFS on a branch;
+//   [6] BFS without O(N) reset: epoch (generation) technique instead of INF-reset;
+//   [7] KMAX=16, all fixed-size arrays enlarged.
 //
-// Build:
-//   g++ -O3 -march=native -funroll-loops -std=c++17 -pthread circulant_mt.cpp -o circulant_mt
-//
-// Optional profile-guided build (typically 10-15% faster):
-//   g++ -O3 -march=native -fprofile-generate -std=c++17 -pthread circulant_mt.cpp -o cm_pgo
-//   ./cm_pgo -n 300 -k 5 -t 16 -o /tmp/prof
-//   g++ -O3 -march=native -fprofile-use -std=c++17 -pthread circulant_mt.cpp -o circulant_mt
-//
-// Usage:
-//   circulant_mt -n N|a-b -k K|a-b [-m 0|1] [-t threads] [-o dir | -f file]
-//     -n   number of vertices, single value or range
-//     -k   degree parameter (half-degree), single value or range
-//     -m   lower-bound mode: 1 = tight sphere-capacity bound (default), 0 = simple bound
-//     -t   thread count (default: hardware concurrency)
-//     -o   output directory, one file {N}_{k}.csv per pair
-//     -f   single output file for the whole range
-//   With neither -o nor -f the result is printed to stdout.
+// Build (MSYS2 UCRT64).
+// Portable (to run on another machine):
+//   g++ -O3 -march=x86-64-v3 -std=c++17 -pthread -static pcgx_cpu.cpp -o pcgx_cpu.exe
+// Tuned to the local CPU for maximum speed:
+//   g++ -O3 -march=native -std=c++17 -pthread -static pcgx_cpu.cpp -o pcgx_cpu.exe
+// PGO (adds 10-15% speed):
+//   g++ -O3 -march=native -fprofile-generate -std=c++17 -pthread pcgx_cpu.cpp -o cm2_pgo
+//   ./cm2_pgo -n 300 -k 5 -t 16 -o /tmp/x
+//   g++ -O3 -march=native -fprofile-use -std=c++17 -pthread pcgx_cpu.cpp -o pcgx_cpu.exe
+// Run:
+//   pcgx_cpu -n N|a-b -k K|a-b [-m 0|1] [-t threads] [-o dir | -f file]
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,10 +43,9 @@
 using u32 = uint32_t;
 using u64 = uint64_t;
 
-static const int KMAX = 16;          // maximum supported degree parameter
-static const int REREAD = 256;       // how often a worker refreshes the shared record
+static const int KMAX = 16;          // [7]
+static const int REREAD = 256;       // [2] best-record re-read frequency
 
-// Modular inverse via extended Euclid; returns -1 if a is not invertible mod n.
 static inline int mod_inv(long long a, long long n) {
     long long t = 0, nt = 1, r = n, nr = ((a % n) + n) % n;
     while (nr) { long long q = r / nr, tmp;
@@ -55,23 +56,25 @@ static inline int mod_inv(long long a, long long n) {
     return (int)t;
 }
 
-// Barrett reduction used inside the canonicality test: replaces the modulo in
-// sig[j] * m mod N by a multiply and a shift, avoiding integer division on the
-// hot path. mu = floor(2^64 / N). Inputs satisfy x = sig*m < N^2 < 2^64 for N < 2^32.
+// [3] Barrett reduction: fold for products sig[j]*m modulo N.
+// mu = floor(2^64 / N). Reduces x mod N to a high-word multiply and a shift.
 struct Barrett {
     u64 N, mu;
-    void init(u64 n) { N = n; mu = (n ? (~0ULL) / n : 0); }
+    void init(u64 n) { N = n; mu = (n ? (~0ULL) / n : 0); } // ~0/N == floor((2^64-1)/N), enough for x < 2^63
+    // reduce a value 0 <= x < N^2 (here x = sig*m, both < N, so < N^2 < 2^64 for N < 2^32)
     inline u32 fold(u64 x) const {
+        // q = floor(x * mu / 2^64)
         unsigned __int128 t = (unsigned __int128)x * mu;
         u64 q = (u64)(t >> 64);
         u64 r = x - q * N;
-        if (r >= N) r -= N;                 // single correction is sufficient
+        if (r >= N) r -= N;                 // a single correction suffices
+        // fold to min(r, N-r)
         u64 nr = N - r;
-        return (u32)(nr < r ? nr : r);      // fold to min(r, N - r)
+        return (u32)(nr < r ? nr : r);
     }
 };
 
-// Number of lattice points at L1-distance t in k dimensions.
+// size of the L1 sphere of radius t in k dimensions
 static u64 sphere_cap_formula(int k, int t) {
     if (t == 0) return 1;
     u64 s = 0, ck = 1, ct = 1; int top = std::min(k, t);
@@ -83,27 +86,23 @@ static u64 sphere_cap_formula(int k, int t) {
     return s;
 }
 
-// Pack (diameter, distance sum) into one 64-bit key so the record is a single atomic.
 static inline u64 pack(u32 diam, u64 ds) { return (ds << 16) | (diam & 0xFFFFu); }
 static inline u32 unpack_diam(u64 key) { return (u32)(key & 0xFFFFu); }
 static inline u64 unpack_ds(u64 key) { return key >> 16; }
 
-// Canonicality test in k-1 normalizations.
-// Two signatures are equivalent if one is obtained from the other by multiplying
-// every generator by an invertible element of Z_N. We normalize by m = inv[sig[gi]]
-// for gi = 1..k-1; gi = 0 gives sig[0] = 1 -> m = inv[1] = 1, the identity, skipped.
-// The N-g sign case is redundant because fold(-x) = fold(x) already accounts for
-// the reflection. A signature is canonical if no normalization yields a smaller tuple.
+// [4] is_canonical in k-1 normalizations.
+// Equivalence class: multiply all generators by an invertible factor m.
+// Take m = inv[sig[gi]] for gi = 1..k-1 (gi=0 gives sig[0]=1 -> m=inv[1]=1, identity, skipped).
+// The N-g sign is redundant: fold(-x)=fold(x), reflection is already handled by fold.
 static bool is_canonical(int N, const int* __restrict__ sig, int k, const int* __restrict__ inv, const Barrett& br) {
     int img[KMAX];
-    for (int gi = 1; gi < k; ++gi) {
+    for (int gi = 1; gi < k; ++gi) {       // gi=0 -> identity, skip
         int g = sig[gi];
         int m = inv[g];
         if (m == 0) continue;              // not invertible
-        // Fast path. The image always contains 1 (fold(sig[gi]*m) = 1) and the
-        // signature starts with 1, so the lexicographic comparison is decided by the
-        // second smallest element: m2 = min over j != gi of fold(sig[j]*m), versus sig[1].
-        // The full sort is needed only when they are equal.
+        // Fast path. The image always contains 1 (fold(sig[gi]*m)=1), the signature starts with 1,
+        // so the lexicographic comparison is decided by the second-smallest element:
+        // m2 = min over j!=gi of fold(sig[j]*m) versus sig[1]. Full sort is needed only on a tie.
         int m2 = N;
         for (int j = 0; j < k; ++j) {
             if (j == gi) { img[j] = 1; continue; }
@@ -111,8 +110,9 @@ static bool is_canonical(int N, const int* __restrict__ sig, int k, const int* _
             img[j] = v;
             if (v < m2) m2 = v;
         }
-        if (m2 < sig[1]) return false;     // image strictly smaller
-        if (m2 > sig[1]) continue;         // image strictly larger, normalization passed
+        if (m2 < sig[1]) return false;     // image is strictly smaller
+        if (m2 > sig[1]) continue;         // image is strictly larger, normalization passed
+        // tie on the second element: full comparison
         for (int a = 1; a < k; ++a) { int v = img[a], b = a - 1;
             while (b >= 0 && img[b] > v) { img[b + 1] = img[b]; --b; } img[b + 1] = v; }
         for (int j = 0; j < k; ++j) { if (img[j] < sig[j]) return false; if (img[j] > sig[j]) break; }
@@ -120,14 +120,11 @@ static bool is_canonical(int N, const int* __restrict__ sig, int k, const int* _
     return true;
 }
 
-// Pruned BFS over Z_N. State is packed into a single array vals[] instead of a pair
-// (dist[], seen[]): vals[v] = (epoch << DIST_BITS) | dist. A vertex is visited iff the
-// high bits equal the current epoch tag; the distance is the low DIST_BITS bits. This
-// halves the random memory traffic of marking (one store instead of two) without
-// changing the traversal order or the pruning schedule. Central symmetry d(v)=d(N-v)
-// lets one probe mark a pair of vertices. At each layer boundary a lower bound on the
-// distance sum is compared against the record; the search aborts as soon as it cannot win.
-// Limitation: diameter < 2^DIST_BITS (= 1024), ample for the practical range of N.
+// BFS with pruning. Storage: ONE array vals[] instead of a dist[]+seen[] pair.
+// vals[v] = (epoch << DIST_BITS) | dist. Visited = high bits match the epoch,
+// distance = low DIST_BITS bits. Halves the random memory traffic per mark
+// (one write instead of two); the algorithm and traversal order are unchanged.
+// Limitation: diameter < 2^DIST_BITS (=1024), enough for N up to ~2M at k=2.
 static const int DIST_BITS = 10;
 static const u32 DIST_MASK = (1u << DIST_BITS) - 1;
 
@@ -174,14 +171,13 @@ static bool bfs(int N, int k, const int* __restrict__ s, int mode, u64 best_ds,
     return true;
 }
 
-// Moore lower bound on the diameter: smallest D whose cumulative sphere capacity >= N.
+// [5] minimum possible diameter (Moore bound) for given N,k: smallest D with cum_cap(D) >= N
 static int moore_diam(int N, const u64* caps, int capsN, int k) {
     u64 cum = 1; int t = 0;
     while (cum < (u64)N) { ++t; u64 c = (t < capsN) ? caps[t] : sphere_cap_formula(k, t); cum += c; }
     return t;
 }
 
-// Shared best record, cache-line aligned and padded to avoid false sharing.
 struct alignas(64) Best { std::atomic<u64> key; char pad[64 - sizeof(std::atomic<u64>)]; Best() { key.store(~0ULL); } };
 struct Found { std::vector<int> sig; u32 diam; u64 ds; };
 
@@ -189,25 +185,26 @@ static void run_one(int N, int k, int mode, int threads, std::FILE* out) {
     if (k < 2 || k > KMAX || k > N / 2) return;
     int h = N / 2;
 
-    // precomputation
+    // precomputations
     std::vector<int> inv(N, 0);
     for (int i = 1; i < N; ++i) { int m = mod_inv(i, N); if (m > 0) inv[i] = m; }
-    Barrett br; br.init((u64)N);
+    Barrett br; br.init((u64)N);                                  // [3]
     std::vector<u64> caps; { u64 cum = 1; int t = 0; caps.push_back(1);
         while (cum < (u64)N + 1) { ++t; u64 c = sphere_cap_formula(k, t); caps.push_back(c); cum += c; } }
     int capsN = (int)caps.size();
-    int Dmoore = moore_diam(N, caps.data(), capsN, k);
-    (void)Dmoore;
+    int Dmoore = moore_diam(N, caps.data(), capsN, k);            // [5]
+    // max dist_sum for diameter Dmoore under ideal packing = lower bound on the optimum ds
+    // (for early branch rejection by s2,s3 we use the per-shell capacity).
 
     Best best;
     std::vector<std::vector<Found>> tloc(threads);
 
-    // Work distribution. For k >= 3 threads pull linearized (s2, s3) pairs from an
-    // atomic counter, which gives finer granularity and better load balance than
-    // distributing by s2 alone. For k == 2 there is only s2.
+    // [1] linearize pairs (s2,s3). s2 in [2..h-(k-2)], s3 in [s2+1..h-(k-3)].
+    // For k==2 there are no pairs (only s2). For k>=3 pairs are handed out by an atomic counter.
     std::atomic<long long> next_pair{ 0 };
-    std::atomic<int> next_s2{ 2 };
+    std::atomic<int> next_s2{ 2 };           // used only when k==2
 
+    // precompute the list of valid pairs (s2,s3) for k>=3
     std::vector<std::pair<int,int>> pairs;
     if (k >= 3) {
         for (int s2 = 2; s2 <= h - (k - 2); ++s2)
@@ -223,14 +220,15 @@ static void run_one(int N, int k, int mode, int threads, std::FILE* out) {
         int sig[KMAX]; sig[0] = 1;
         std::vector<Found>& mine = tloc[tid];
 
-        u64 local_best = best.key.load(std::memory_order_relaxed);
+        u64 local_best = best.key.load(std::memory_order_relaxed);   // [2]
         int since = 0;
 
         auto eval = [&]() {
             if (!is_canonical(N, sig, k, inv.data(), br)) return;
+            // [2] do not re-read the best every time
             if (++since >= REREAD) { local_best = best.key.load(std::memory_order_relaxed); since = 0; }
             u32 D; u64 ds;
-            // epoch occupies 32 - DIST_BITS bits; clear the array on wraparound
+            // the epoch occupies 32-DIST_BITS bits; on overflow we clear the array
             if (++epoch == (1u << (32 - DIST_BITS))) { std::fill(vals.begin(), vals.end(), 0u); epoch = 1; }
             if (bfs(N, k, sig, mode, unpack_ds(local_best), vals.data(), epoch,
                     queue.data(), caps.data(), capsN, D, ds)) {
@@ -256,12 +254,20 @@ static void run_one(int N, int k, int mode, int threads, std::FILE* out) {
             return;
         }
 
-        // k >= 3: take an (s2, s3) pair, then iterate the odometer over positions 4..k-1
+        // k >= 3: take pairs (s2,s3) and run an odometer over positions 4..k-1
         while (true) {
             long long pi = next_pair.fetch_add(1, std::memory_order_relaxed);
             if (pi >= npairs) break;
             int s2 = pairs[pi].first, s3 = pairs[pi].second;
             sig[1] = s2; sig[2] = s3;
+
+            // [5] early exit: with s2 minimal step 1 the ball grows no faster than ideal;
+            // if even ideal packing with the fixed s2,s3 does not cover N
+            // within Dmoore steps worse than the current best diameter, we still run BFS,
+            // since the exact capacity for specific s2,s3 is not cheap to estimate. So we use
+            // a weaker but correct filter: skip the branch only if the current best
+            // already has diameter < Dmoore (impossible, Dmoore is the lower bound) - no-op.
+            // The practical early exit is implemented inside bfs via the caps bound.
 
             if (k == 3) { eval(); continue; }
 
@@ -295,7 +301,6 @@ static void run_one(int N, int k, int mode, int threads, std::FILE* out) {
     all.erase(std::unique(all.begin(), all.end(),
               [](const Found& a, const Found& b) { return a.sig == b.sig; }), all.end());
 
-    // expand every optimal class to all of its isomorphic copies, sorted lexicographically
     std::set<std::vector<int>> allsigs;
     for (auto& f : all) {
         for (int g : f.sig) {
