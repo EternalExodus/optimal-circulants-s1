@@ -1,4 +1,4 @@
-# optimal-circulants-s1
+# PCGX-CPU
 
 Multithreaded exact search for optimal circulant graphs
 **C(N; 1, s₂, …, s_k)** with the first generator fixed to 1.
